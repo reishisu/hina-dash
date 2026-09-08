@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ひなの調べぐせ — ダッシュボード</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="https://unpkg.com/vue@3.4.21/dist/vue.global.prod.js"></script>
+<style>
+  body { background:#0f1218; color:#e6e9f0; font-family: "Segoe UI", Meiryo, system-ui, sans-serif; }
+  .card { background:#171c26; border:1px solid #232a38; border-radius:14px; }
+  .kpi { font-variant-numeric: tabular-nums; }
+  .chip { display:inline-block; padding:2px 10px; border-radius:999px; font-size:12px; }
+  .ok { background:#12372a; color:#7bd88f } .ng { background:#3a1a1a; color:#ff8b8b } .wait { background:#2d2a12; color:#f5c95c }
+  canvas { max-height: 260px; }
+</style>
+</head>
+<body class="min-h-screen">
+<div id="app" class="max-w-7xl mx-auto p-4 md:p-6" v-cloak>
+  <header class="flex flex-wrap items-end justify-between gap-3 mb-5">
+    <div>
+      <h1 class="text-2xl md:text-3xl font-black tracking-tight">ひなの調べぐせ <span class="text-pink-400">ダッシュボード</span></h1>
+      <p class="text-sm text-slate-400 mt-1">更新 {{ d.generated }} JST（5 分ごと）。<span :class="['chip', stale ? 'ng' : 'ok']">{{ stale ? '更新が止まっている' : '最新' }}</span></p>
+    </div>
+    <div class="text-sm text-slate-400">
+      <span class="chip wait">負荷 {{ loadNow.time || '—' }}</span>
+      CPU <b class="text-amber-300">{{ loadNow.cpu ?? '—' }}</b>% ／ メモリ <b class="text-amber-300">{{ loadNow.mem ?? '—' }}</b>%
+    </div>
+  </header>
+
+  <!-- KPI -->
+  <section class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
+    <div class="card p-4"><div class="text-xs text-slate-400">今日の作業</div><div class="kpi text-3xl font-black mt-1">{{ today.hours.toFixed(1) }}<span class="text-base font-normal text-slate-400"> 時間</span></div><div class="text-xs text-slate-500 mt-1">昨日 {{ yday.hours.toFixed(1) }} h</div></div>
+    <div class="card p-4"><div class="text-xs text-slate-400">Claude 出力トークン</div><div class="kpi text-3xl font-black mt-1">{{ fmtK(today.outTok) }}</div><div class="text-xs text-slate-500 mt-1">入力 {{ fmtM(today.inTok) }}（キャッシュ込）</div></div>
+    <div class="card p-4"><div class="text-xs text-slate-400">ChatGPT 往復</div><div class="kpi text-3xl font-black mt-1">{{ today.trips }}<span class="text-base font-normal text-slate-400"> 回</span></div><div class="text-xs text-slate-500 mt-1">待ち 中央値 {{ today.waitMed ?? '—' }} 分 ／ 合計 {{ today.waitTot }} 分</div></div>
+    <div class="card p-4"><div class="text-xs text-slate-400">再生（全動画の増分）</div><div class="kpi text-3xl font-black mt-1">{{ today.views }}<span class="text-base font-normal text-slate-400"> 回</span></div><div class="text-xs text-slate-500 mt-1">14 日合計 {{ sum(d.views_inc) }} 回</div></div>
+  </section>
+
+  <!-- 関門 -->
+  <section class="card p-4 mb-5">
+    <div class="flex items-center justify-between mb-2"><h2 class="font-bold">打ち切りの関門（AI 損得ジャンル）</h2><span class="text-xs text-slate-400">合格企画の公開 14 日後で判定</span></div>
+    <div class="grid md:grid-cols-3 gap-3 text-sm">
+      <div v-for="g in gates" :key="g.date" class="rounded-xl p-3 bg-[#111621] border border-[#232a38]">
+        <div class="flex items-center justify-between"><b>{{ g.date }}</b><span :class="['chip', g.cls]">{{ g.status }}</span></div>
+        <div class="text-slate-300 mt-1">{{ g.cond }}</div>
+        <div class="text-slate-500 text-xs mt-1">残り {{ g.left }} 日 ／ 1,000 回超えの動画: {{ over1000 }} 本 ／ 1 万回超え: {{ over10000 }} 本</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- charts -->
+  <section class="grid md:grid-cols-2 gap-4">
+    <div class="card p-4"><h2 class="font-bold mb-2">作業時間 [時間/日]</h2><canvas id="cHours"></canvas></div>
+    <div class="card p-4"><h2 class="font-bold mb-2">Claude 出力トークン [千/日]（モデル別）</h2><canvas id="cTok"></canvas></div>
+    <div class="card p-4"><h2 class="font-bold mb-2">ChatGPT 往復 [回] と 待ち時間の合計 [分]</h2><canvas id="cGpt"></canvas></div>
+    <div class="card p-4"><h2 class="font-bold mb-2">再生の増分 [回/日]</h2><canvas id="cViews"></canvas></div>
+    <div class="card p-4 md:col-span-2"><h2 class="font-bold mb-2">負荷（CPU / メモリ %）<span class="text-xs text-slate-400 ml-2">load-sampler が動いている間だけ</span></h2><canvas id="cLoad" style="max-height:180px"></canvas></div>
+  </section>
+
+  <!-- videos -->
+  <section class="card p-4 mt-4">
+    <h2 class="font-bold mb-2">動画別の累計再生（上位 12）</h2>
+    <div class="overflow-x-auto">
+    <table class="w-full text-sm">
+      <thead class="text-slate-400 text-left"><tr><th class="py-1 pr-3">公開</th><th class="py-1 pr-3">題名</th><th class="py-1 text-right">再生</th><th class="py-1 pl-3">推移</th></tr></thead>
+      <tbody>
+        <tr v-for="v in topVideos" :key="v.id" class="border-t border-[#232a38]">
+          <td class="py-1 pr-3 text-slate-400 whitespace-nowrap">{{ v.pub }}</td>
+          <td class="py-1 pr-3">{{ v.title }}</td>
+          <td class="py-1 text-right kpi font-bold">{{ v.views.toLocaleString() }}</td>
+          <td class="py-1 pl-3"><svg :width="120" :height="22"><polyline :points="spark(v.series)" fill="none" stroke="#f5c95c" stroke-width="1.5"/></svg></td>
+        </tr>
+      </tbody>
+    </table></div>
+  </section>
+  <footer class="text-xs text-slate-500 mt-6">データ: Claude Code の記録／ChatGPT の往復ログ／YouTube の再生記録／PC の負荷記録。数字は「実測」で、予測は含まない。</footer>
+</div>
+
+<script>
+const { createApp, ref, computed, onMounted } = Vue;
+Chart.defaults.color = '#9aa3b5'; Chart.defaults.borderColor = '#232a38';
+createApp({
+  setup() {
+    const d = ref({ generated: '', days: [], hours: [], out_tokens: {}, in_tokens: [], chatgpt_trips: [], chatgpt_wait_median: [], chatgpt_wait_total: [], views_inc: [], videos: {}, load: [] });
+    const charts = {};
+    const last = (a, i = 1) => a.length >= i ? a[a.length - i] : 0;
+    const sum = a => a.reduce((x, y) => x + (y || 0), 0);
+    const fmtK = n => (n / 1000).toFixed(1) + ' k';
+    const fmtM = n => (n / 1e6).toFixed(2) + ' M';
+    const day = i => ({
+      hours: last(d.value.hours, i) || 0,
+      outTok: sum(Object.values(d.value.out_tokens).map(a => last(a, i) || 0)),
+      inTok: last(d.value.in_tokens, i) || 0,
+      trips: last(d.value.chatgpt_trips, i) || 0,
+      waitMed: last(d.value.chatgpt_wait_median, i),
+      waitTot: last(d.value.chatgpt_wait_total, i) || 0,
+      views: last(d.value.views_inc, i) || 0,
+    });
+    const today = computed(() => day(1)), yday = computed(() => day(2));
+    const stale = computed(() => d.value.generated && (Date.now() - new Date(d.value.generated.replace(' ', 'T') + '+09:00')) > 20 * 60 * 1000);
+    const loadNow = computed(() => { const r = last(d.value.load); if (!r || !r.length) return {}; const t = new Date(r[0]); if (Date.now() - t > 3 * 60 * 1000 + 9 * 3600 * 1000 - new Date().getTimezoneOffset() * -60000 * 0) {} return { time: r[0].slice(11, 16), cpu: r[1], mem: r[2] }; });
+    const videos = computed(() => Object.entries(d.value.videos).map(([id, v]) => ({ id, ...v })));
+    const topVideos = computed(() => [...videos.value].sort((a, b) => b.views - a.views).slice(0, 12));
+    const over1000 = computed(() => videos.value.filter(v => v.views >= 1000).length);
+    const over10000 = computed(() => videos.value.filter(v => v.views >= 10000).length);
+    const gates = computed(() => {
+      const now = new Date();
+      const mk = (date, cond, ok) => { const left = Math.ceil((new Date(date + 'T23:59:59+09:00') - now) / 86400000); return { date, cond, left, status: ok ? '達成' : (left < 0 ? '未達' : '判定前'), cls: ok ? 'ok' : (left < 0 ? 'ng' : 'wait') }; };
+      return [
+        mk('2026-10-04', '9/20 までの 6 本で、14 日後 1,000 回以上が 1 本', over1000.value >= 1),
+        mk('2026-10-18', '12 本で 1,000 回以上が 3 本、うち 1 万回以上が 1 本', over1000.value >= 3 && over10000.value >= 1),
+        mk('2026-11-15', '直近 30 日の長尺合計 10 万回', sum(d.value.views_inc) >= 100000),
+      ];
+    });
+    const spark = s => { if (!s || s.length < 2) return ''; const vs = s.map(x => x[1]); const mx = Math.max(...vs, 1); return vs.map((v, i) => `${(i / (vs.length - 1)) * 118 + 1},${21 - (v / mx) * 19}`).join(' '); };
+    function mkChart(id, cfg) { if (charts[id]) charts[id].destroy(); charts[id] = new Chart(document.getElementById(id), cfg); }
+    function draw() {
+      const labels = d.value.days.map(x => x.slice(5).replace('-', '/'));
+      const base = { responsive: true, plugins: { legend: { labels: { boxWidth: 10 } } }, scales: { x: { grid: { display: false } } } };
+      mkChart('cHours', { type: 'bar', data: { labels, datasets: [{ label: '時間', data: d.value.hours, backgroundColor: '#4c8dff', borderRadius: 6 }] }, options: base });
+      const cols = ['#ff7f50', '#4c8dff', '#55a868', '#c678dd', '#f5c95c'];
+      mkChart('cTok', { type: 'bar', data: { labels, datasets: Object.entries(d.value.out_tokens).map(([m, a], i) => ({ label: m, data: a.map(x => x / 1000), backgroundColor: cols[i % cols.length], stack: 's', borderRadius: 4 })) }, options: { ...base, scales: { x: { stacked: true, grid: { display: false } }, y: { stacked: true } } } });
+      mkChart('cGpt', { type: 'bar', data: { labels, datasets: [{ label: '往復 [回]', data: d.value.chatgpt_trips, backgroundColor: '#55a868', borderRadius: 6, yAxisID: 'y' }, { type: 'line', label: '待ち合計 [分]', data: d.value.chatgpt_wait_total, borderColor: '#f5c95c', backgroundColor: '#f5c95c', tension: .3, yAxisID: 'y1' }] }, options: { ...base, scales: { x: { grid: { display: false } }, y: { position: 'left' }, y1: { position: 'right', grid: { display: false } } } } });
+      mkChart('cViews', { type: 'bar', data: { labels, datasets: [{ label: '再生の増分', data: d.value.views_inc, backgroundColor: '#e2437a', borderRadius: 6 }] }, options: base });
+      const L = d.value.load;
+      mkChart('cLoad', { type: 'line', data: { labels: L.map(r => r[0].slice(5, 16).replace('T', ' ')), datasets: [{ label: 'CPU %', data: L.map(r => r[1]), borderColor: '#4c8dff', pointRadius: 0, tension: .2 }, { label: 'メモリ %', data: L.map(r => r[2]), borderColor: '#ff7f50', pointRadius: 0, tension: .2 }] }, options: { ...base, scales: { x: { ticks: { maxTicksLimit: 8 }, grid: { display: false } }, y: { min: 0, max: 100 } } } });
+    }
+    async function load() {
+      try { const r = await fetch('data.json?' + Date.now(), { cache: 'no-store' }); d.value = await r.json(); draw(); } catch (e) { console.error(e); }
+    }
+    onMounted(() => { load(); setInterval(load, 60 * 1000); });
+    return { d, today, yday, stale, loadNow, topVideos, over1000, over10000, gates, sum, fmtK, fmtM, spark };
+  }
+}).mount('#app');
+</script>
+</body>
+</html>
